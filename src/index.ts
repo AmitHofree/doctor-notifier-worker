@@ -24,6 +24,10 @@ export default class extends WorkerEntrypoint<Env> {
 		this.bot = bot;
 	}
 
+	async fetch() {
+		return new Response("OK");
+	}
+
 	async checkAndNotify(itemKeyIndex: string) {
 		const newAppointmentDate = await this.fetchNewAppointmentDate(itemKeyIndex);
 		const lastAppointmentDate = await this.fetchOldAppointmentDate(itemKeyIndex);
