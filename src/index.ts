@@ -14,7 +14,7 @@ interface Env {
 
 const TIME_WINDOW = 60;
 
-export class DoctorNotifierWorker extends WorkerEntrypoint<Env> {
+export default class extends WorkerEntrypoint<Env> {
 	bot: Bot;
 
 	constructor(ctx: ExecutionContext, env: Env) {
