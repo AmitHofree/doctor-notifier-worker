@@ -1,5 +1,10 @@
 import { WorkerEntrypoint } from 'cloudflare:workers';
-import { Bot, CommandContext, Context, webhookCallback } from 'grammy'; 
+import { Bot } from 'grammy';
+
+type NotificationsRegisteredRow = {
+	chat_id: number;
+	item_key_index: string;
+};
 
 interface Env {
 	BOT_INFO: string;
@@ -7,6 +12,7 @@ interface Env {
 	DB: D1Database;
 }
 
+const TIME_WINDOW = 60;
 
 export class DoctorNotifierWorker extends WorkerEntrypoint<Env> {
 	bot: Bot;
@@ -18,21 +24,18 @@ export class DoctorNotifierWorker extends WorkerEntrypoint<Env> {
 		this.bot = bot;
 	}
 
-	async checkAndNotify(itemKeyIdentifier: string) {
-		const newAppointmentDate = await fetchNewAppointmentDate(itemKeyIdentifier);
-		const lastAppointmentDate = await fetchOldAppointmentDate(itemKeyIdentifier);
+	async checkAndNotify(itemKeyIndex: string) {
+		const newAppointmentDate = await this.fetchNewAppointmentDate(itemKeyIndex);
+		const lastAppointmentDate = await this.fetchOldAppointmentDate(itemKeyIndex);
 
 		if (newAppointmentDate && newAppointmentDate !== lastAppointmentDate) {
 			console.log(`New appointment date found: ${newAppointmentDate}`);
-			const isWithinNextDays = isAppointmentWithinNextDays(newAppointmentDate, 60);
+			const isWithinNextDays = isDateWithinNextDays(newAppointmentDate, TIME_WINDOW);
 
 			if (isWithinNextDays) {
-				console.log('Appointment is within the next 60 days, notifying users');
-				await notifyUsers(
-					`New available appointment date: ${newAppointmentDate}\nSchedule an appointment using the link: ${env.APPOINTMENT_URL}`,
-					env
-				);
-				await env.STORAGE.put('last_appointment_date', newAppointmentDate);
+				console.log(`Appointment is within the next ${TIME_WINDOW} days, notifying users`);
+				await this.notifyUsers(itemKeyIndex, newAppointmentDate);
+				await this.saveAppointmentDate(itemKeyIndex, newAppointmentDate);
 			} else {
 				console.log('New appointment date is not within the next 60 days');
 			}
@@ -40,93 +43,132 @@ export class DoctorNotifierWorker extends WorkerEntrypoint<Env> {
 			console.log('No new appointment date or no change');
 		}
 	}
-}
 
-async function fetchNewAppointmentDate(itemKeyIdentifier: string): Promise<Date> {
-	const maxAttempts = 3;
-
-	for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+	private async fetchOldAppointmentDate(itemKeyIndex: string): Promise<Date | null> {
 		try {
-			const response = await fetch(appointmentUrl, {
-				headers: {
-					'User-Agent':
-						'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3',
-					Accept:
-						'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9',
-					'Accept-Language': 'en-US,en;q=0.9',
-				},
-			});
-
-			const text = await response.text();
-
-			if (!response.ok) {
-				throw new Error(`Failed to fetch webpage. Status: ${response.status}. Text: ${text}`);
-			}
-
-			// Process the successful response outside the retry loop
-			const initialStateMatch = text.match(/window\.__INITIAL_STATE__ = ({.*?})\s*;/s);
-			if (!initialStateMatch) {
-				throw new Error('Initial state match not found in webpage content.');
-			}
-
-			const initialStateStr = initialStateMatch[1];
-			const data = JSON.parse(initialStateStr);
-			const fullDateStr = data?.info?.infoResults?.AppointmentDateTime;
-			if (!fullDateStr) {
-				// Acceptable state
-				return null;
-			}
-
-			const dateMatch = fullDateStr.match(/\d{2}\/\d{2}\/\d{2,4}/);
-			if (!dateMatch) {
-				throw new Error('Appointment date format is incorrect or missing.');
-			}
-
-			return dateMatch[0];
-		} catch (error) {
-			if (error instanceof Error)
-				console.error(`Attempt ${attempt} failed: ${error.message}`);
-			else 
-				console.error(`Attempt ${attempt} failed: ${error}`)
-			// Optionally, wait before retrying
-			if (attempt < maxAttempts) {
-				await new Promise((resolve) => setTimeout(resolve, 1000)); // Wait for 1 second
-			}
+			const stmt = this.env.DB.prepare('SELECT * FROM notification_date WHERE item_key_index = ?').bind(itemKeyIndex);
+			const lastNotificationDate = await stmt.first<string>('last_notification_date');
+			if (!lastNotificationDate) return null;
+			return new Date(Date.parse(lastNotificationDate));
+		} catch (e) {
+			console_error('Error executing SQL query in fetchOldAppointmentDate', e);
+			return null;
 		}
 	}
-	throw new Error('All attempts to fetch the webpage have failed.');
+
+	private async fetchNewAppointmentDate(itemKeyIndex: string): Promise<Date | null> {
+		const maxAttempts = 3;
+		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+			try {
+				const response = await fetch(generateAppointmentUrl(itemKeyIndex), {
+					headers: {
+						'User-Agent':
+							'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3',
+						Accept:
+							'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9',
+						'Accept-Language': 'en-US,en;q=0.9',
+					},
+				});
+
+				const text = await response.text();
+
+				if (!response.ok) {
+					throw new Error(`Failed to fetch webpage. Status: ${response.status}. Text: ${text}`);
+				}
+
+				// Process the successful response outside the retry loop
+				const initialStateMatch = text.match(/window\.__INITIAL_STATE__ = ({.*?})\s*;/s);
+				if (!initialStateMatch) {
+					throw new Error('Initial state match not found in webpage content');
+				}
+
+				const initialStateStr = initialStateMatch[1];
+				const data = JSON.parse(initialStateStr);
+				const fullDateStr = data?.info?.infoResults?.AppointmentDateTime;
+				if (!fullDateStr) {
+					// Acceptable state
+					return null;
+				}
+
+				const dateMatch = fullDateStr.match(/(\d{2})\/(\d{2})\/(\d{2,4})/);
+				if (!dateMatch) {
+					throw new Error('Appointment date format is incorrect or missing');
+				}
+				const [_, day, month, year] = dateMatch;
+				return new Date(2000 + Number(year), Number(month) - 1, Number(day));
+			} catch (error) {
+				console_error(`Attempt ${attempt} failed: `, error);
+				// Optionally, wait before retrying
+				if (attempt < maxAttempts) sleep(1);
+			}
+		}
+		throw new Error('Failed fetching the new appointment date');
+	}
+
+	private async saveAppointmentDate(itemKeyIndex: string, appointmentDate: Date) {
+		const dateString = appointmentDate.toISOString();
+		try {
+			const stmt = this.env.DB.prepare(
+				'INSERT INTO notification_date (item_key_index, last_notification_date) VALUES (?, ?) ON CONFLICT (item_key_index) DO UPDATE SET last_notification_date = ?'
+			).bind(itemKeyIndex, dateString, dateString);
+			const { success } = await stmt.run();
+			if (!success) {
+				console.log('Unknown error executing SQL query in saveAppointmentDate');
+			}
+		} catch (e) {
+			console_error('Error executing SQL query in saveAppointmentDate', e);
+		}
+	}
+
+	private async fetchRegisteredUsers(itemKeyIndex: string): Promise<number[]> {
+		try {
+			const stmt = this.env.DB.prepare('SELECT * FROM notifications_registered WHERE item_key_index = ?').bind(itemKeyIndex);
+			const { results, success } = await stmt.all<NotificationsRegisteredRow>();
+			if (!success) {
+				console.log('Unknown error executing SQL query in fetchRegisteredUsers');
+				return [];
+			}
+			return results.map((result) => result.chat_id);
+		} catch (e) {
+			console_error('Error executing SQL query in fetchRegisteredUsers', e);
+			return [];
+		}
+	}
+
+	private async notifyUsers(itemKeyIndex: string, appointmentDate: Date) {
+		const appointmentLink = generateAppointmentUrl(itemKeyIndex);
+		const appointmentDateString = appointmentDate.toISOString();
+		const registeredUsers = await this.fetchRegisteredUsers(itemKeyIndex);
+		await Promise.all(
+			registeredUsers.map((user) =>
+				this.bot.api.sendMessage(
+					user,
+					`New available appointment date: ${appointmentDateString}\nSchedule an appointment using the link: ${appointmentLink}`
+				)
+			)
+		);
+	}
 }
 
-async function fetchOldAppointmentDate(itemKeyIdentifier: string): Promise<Date> {}
-
-
-function isAppointmentWithinNextDays(appointmentDateStr, days = 60) {
-	const appointmentDate = new Date(appointmentDateStr);
+function isDateWithinNextDays(date: Date, days: number): boolean {
 	const today = new Date();
 	const daysLater = new Date(today);
 	daysLater.setDate(daysLater.getDate() + days);
-
-	return appointmentDate >= today && appointmentDate <= daysLater;
+	return date >= today && date <= daysLater;
 }
 
+function generateAppointmentUrl(itemKeyIndex: string): string {
+	return `https://serguide.maccabi4u.co.il/heb/doctors/doctorssearchresults/doctorsinfopage/?ItemKeyIndex=${itemKeyIndex}`;
+}
 
-async function notifyUsers(message, env) {
-	const activeChatIdsJson = await env.STORAGE.get('active_chat_ids');
-	if (!activeChatIdsJson) return;
-
-	const activeChatIds = JSON.parse(activeChatIdsJson);
-	for (const chatId of activeChatIds) {
-		await sendMessage(chatId, message, env.TELEGRAM_BOT_TOKEN);
+function console_error(message: string, e: any) {
+	if (e instanceof Error) {
+		console.error(`${message} ${e.message}`);
+	} else {
+		console.error(`${message} ${e}`);
 	}
 }
 
-async function sendMessage(chatId, text, telegramBotToken) {
-	await fetch(`https://api.telegram.org/bot${telegramBotToken}/sendMessage`, {
-		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify({
-			chat_id: chatId,
-			text: text,
-		}),
-	});
+async function sleep(secs: number) {
+	await new Promise((resolve) => setTimeout(resolve, secs * 1000));
 }
