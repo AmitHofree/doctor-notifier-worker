@@ -33,7 +33,7 @@ export default class extends WorkerEntrypoint<Env> {
 		const newAppointmentDate = await this.fetchNewAppointmentDate(itemKeyIndex);
 		const lastAppointmentDate = await this.fetchOldAppointmentDate(itemKeyIndex);
 
-		if (newAppointmentDate && newAppointmentDate !== lastAppointmentDate) {
+		if (newAppointmentDate && newAppointmentDate.getTime() !== lastAppointmentDate?.getTime()) {
 			console.log(`New appointment date found: ${newAppointmentDate}`);
 			const isWithinNextDays = isDateWithinNextDays(newAppointmentDate, TIME_WINDOW);
 
