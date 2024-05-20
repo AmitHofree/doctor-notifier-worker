@@ -15,7 +15,7 @@ interface Env {
 const TIME_WINDOW = 60;
 
 export default class extends WorkerEntrypoint<Env> {
-	bot: Bot;
+	private bot: Bot;
 
 	constructor(ctx: ExecutionContext, env: Env) {
 		super(ctx, env);
@@ -24,11 +24,12 @@ export default class extends WorkerEntrypoint<Env> {
 		this.bot = bot;
 	}
 
-	async fetch() {
-		return new Response("OK");
+	public async fetch() {
+		return new Response('OK');
 	}
 
-	async checkAndNotify(itemKeyIndex: string) {
+	public async checkAndNotify(itemKeyIndex: string) {
+		console.log(`Received request for ${itemKeyIndex}`);
 		const newAppointmentDate = await this.fetchNewAppointmentDate(itemKeyIndex);
 		const lastAppointmentDate = await this.fetchOldAppointmentDate(itemKeyIndex);
 
